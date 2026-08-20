@@ -1,29 +1,73 @@
-"""Route Optimization Service using Google OR-Tools"""
+"""Route Optimization Service using Google OR-Tools and Google Maps API"""
 import time
+import logging
 from typing import List, Tuple, Dict
 from datetime import datetime, timedelta
 from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 from app.models.vehicle import Vehicle
 from app.models.location import Stop, Location
 from app.models.optimization import OptimizedRoute, RouteStop, OptimizationResponse
+from app.services.maps_service import MapsService
+from app.config import GOOGLE_MAPS_API_KEY
+
+logger = logging.getLogger(__name__)
 
 
 class RouteOptimizerService:
-    """Service for route optimization using OR-Tools"""
+    """Service for route optimization using OR-Tools and Google Maps API"""
     
     def __init__(self):
         self.routing = None
         self.manager = None
         self.solution = None
+        self.maps_service = MapsService(api_key=GOOGLE_MAPS_API_KEY)
+        logger.info("RouteOptimizerService initialized")
         
     def calculate_distance_matrix(self, locations: List[Location]) -> List[List[int]]:
         """
         Calculate distance matrix between all locations.
-        In production, integrate with Google Maps API or similar.
+        Uses Google Maps API if available, falls back to Haversine formula.
         
-        For now, using simplified Haversine formula for demonstration.
+        Args:
+            locations: List of locations
+            
+        Returns:
+            2D list of distances in meters
+        """
+        logger.info(f"Calculating distance matrix for {len(locations)} locations using Google Maps API")
+        
+        try:
+            # Convert locations to coordinate tuples
+            coordinates = [(loc.latitude, loc.longitude) for loc in locations]
+            
+            # Use Google Maps service to get distance matrix
+            distance_matrix = self.maps_service.get_distance_matrix(
+                origins=coordinates,
+                destinations=coordinates,
+                mode="driving"
+            )
+            
+            logger.info(f"Distance matrix calculated successfully: {len(distance_matrix)}x{len(distance_matrix[0])}")
+            return distance_matrix
+            
+        except Exception as e:
+            logger.error(f"Error calculating distance matrix: {str(e)}")
+            # Fallback to Haversine
+            return self._calculate_haversine_matrix(locations)
+    
+    def _calculate_haversine_matrix(self, locations: List[Location]) -> List[List[int]]:
+        """
+        Fallback: Calculate distance matrix using Haversine formula.
+        
+        Args:
+            locations: List of locations
+            
+        Returns:
+            2D list of distances in meters
         """
         import math
+        
+        logger.warning("Falling back to Haversine formula for distance matrix")
         
         def haversine(lat1, lon1, lat2, lon2):
             """Calculate distance in meters between two coordinates"""
@@ -62,7 +106,7 @@ class RouteOptimizerService:
         time_limit_seconds: int = 30,
     ) -> OptimizationResponse:
         """
-        Optimize routes for vehicles and stops using OR-Tools.
+        Optimize routes for vehicles and stops using OR-Tools and Google Maps.
         
         Args:
             vehicles: List of available vehicles
@@ -75,23 +119,31 @@ class RouteOptimizerService:
             OptimizationResponse with optimized routes
         """
         start_time = time.time()
+        logger.info(f"Starting route optimization for {len(vehicles)} vehicles and {len(stops)} stops")
         
         try:
             if end_location is None:
                 end_location = start_location
             
-            # Prepare locations list: [depot, ...stops, ...depot]
-            all_locations = [start_location] + stops + [end_location]
+            # Prepare locations list: [depot, ...stops, ...end_depot]
+            all_locations = [start_location] + stops + ([end_location] if start_location.id != end_location.id else [])
             
-            # Calculate distance matrix
+            logger.info(f"Total locations to process: {len(all_locations)}")
+            
+            # Calculate distance matrix using Google Maps
             distance_matrix = self.calculate_distance_matrix(all_locations)
             
+            logger.info(f"Distance matrix shape: {len(distance_matrix)}x{len(distance_matrix[0])}")
+            
             # Create routing index manager
+            num_locations = len(all_locations)
+            num_vehicles = len(vehicles)
+            depot_index = 0
+            
             self.manager = pywrapcp.RoutingIndexManager(
-                len(all_locations),
-                len(vehicles),
-                0,  # Start from depot (index 0)
-                len(all_locations) - 1 if start_location.id != end_location.id else 0  # End at depot
+                num_locations,
+                num_vehicles,
+                depot_index,  # Start from depot (index 0)
             )
             
             # Create routing model
@@ -109,7 +161,7 @@ class RouteOptimizerService:
             # Add capacity constraint
             def demand_callback(from_index):
                 from_node = self.manager.IndexToNode(from_index)
-                if from_node == 0 or from_node == len(all_locations) - 1:
+                if from_node == 0 or from_node >= len(all_locations) - 1:
                     return 0
                 return int(stops[from_node - 1].demand)
             
@@ -132,16 +184,27 @@ class RouteOptimizerService:
             )
             search_parameters.time_limit.seconds = int(time_limit_seconds)
             
+            logger.info(f"Starting OR-Tools solver with {time_limit_seconds}s time limit")
+            
             # Solve
             self.solution = self.routing.SolveFromAssignmentWithParameters(
                 self.routing.ReadAssignmentFromRoutes([[]], True),
                 search_parameters
             )
             
+            if not self.solution:
+                logger.warning("No solution found by OR-Tools solver")
+                return OptimizationResponse(
+                    success=False,
+                    message="No feasible solution found",
+                    optimization_time_ms=int((time.time() - start_time) * 1000),
+                )
+            
             # Extract optimized routes
             optimized_routes = self._extract_routes(all_locations, vehicles, stops)
             
             optimization_time_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Optimization completed in {optimization_time_ms}ms. Found {len(optimized_routes)} routes")
             
             return OptimizationResponse(
                 success=True,
@@ -155,6 +218,7 @@ class RouteOptimizerService:
             
         except Exception as e:
             optimization_time_ms = int((time.time() - start_time) * 1000)
+            logger.error(f"Optimization failed: {str(e)}", exc_info=True)
             return OptimizationResponse(
                 success=False,
                 message=f"Optimization failed: {str(e)}",
@@ -169,6 +233,14 @@ class RouteOptimizerService:
     ) -> List[OptimizedRoute]:
         """
         Extract optimized routes from OR-Tools solution.
+        
+        Args:
+            all_locations: All locations including depot and stops
+            vehicles: List of vehicles
+            stops: List of stops
+            
+        Returns:
+            List of optimized routes
         """
         optimized_routes = []
         
@@ -188,34 +260,35 @@ class RouteOptimizerService:
                 node_index = self.manager.IndexToNode(index)
                 
                 # Skip depot nodes at start and end
-                if 0 < node_index < len(all_locations) - 1:
-                    stop = stops[node_index - 1]
-                    next_index = route_indices.Next(index)
-                    next_node = self.manager.IndexToNode(next_index)
-                    
-                    distance = self.routing.GetArcCostForVehicle(index, next_index, vehicle_id)
-                    cumulative_distance += distance
-                    
-                    # Calculate fuel consumption
-                    distance_km = distance / 1000
-                    fuel_used = (distance_km / 100) * vehicle.fuel_consumption
-                    cumulative_fuel += fuel_used
-                    cumulative_cost += fuel_used * vehicle.fuel_cost_per_liter
-                    
-                    cumulative_demand += stop.demand
-                    
-                    route_stops.append(
-                        RouteStop(
-                            stop_id=stop.id,
-                            stop_name=stop.name,
-                            arrival_time=0,  # TODO: Calculate from time windows
-                            departure_time=0,
-                            demand=stop.demand,
-                            cumulative_distance=cumulative_distance / 1000,  # Convert to km
-                            cumulative_fuel_consumption=cumulative_fuel,
-                            cumulative_cost=cumulative_cost,
+                if 0 < node_index < len(all_locations):
+                    if node_index - 1 < len(stops):  # Make sure it's a valid stop
+                        stop = stops[node_index - 1]
+                        next_index = route_indices.Next(index)
+                        next_node = self.manager.IndexToNode(next_index)
+                        
+                        distance = self.routing.GetArcCostForVehicle(index, next_index, vehicle_id)
+                        cumulative_distance += distance
+                        
+                        # Calculate fuel consumption
+                        distance_km = distance / 1000
+                        fuel_used = (distance_km / 100) * vehicle.fuel_consumption
+                        cumulative_fuel += fuel_used
+                        cumulative_cost += fuel_used * vehicle.fuel_cost_per_liter
+                        
+                        cumulative_demand += stop.demand
+                        
+                        route_stops.append(
+                            RouteStop(
+                                stop_id=stop.id,
+                                stop_name=stop.name,
+                                arrival_time=0,  # TODO: Calculate from time windows
+                                departure_time=0,
+                                demand=stop.demand,
+                                cumulative_distance=cumulative_distance / 1000,  # Convert to km
+                                cumulative_fuel_consumption=cumulative_fuel,
+                                cumulative_cost=cumulative_cost,
+                            )
                         )
-                    )
                 
                 index = route_indices.Next(index)
             
@@ -234,5 +307,7 @@ class RouteOptimizerService:
                         utilization_rate=min(utilization, 100),
                     )
                 )
+            else:
+                logger.debug(f"Vehicle {vehicle.id} has no assigned stops")
         
         return optimized_routes
