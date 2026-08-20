@@ -7,6 +7,9 @@ python-dotenv==1.0.0
 # Route Optimization
 ortools==9.7.2996
 
+# Google Maps API
+googlemaps==4.10.0
+
 # Database
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
@@ -29,3 +32,6 @@ python-json-logger==2.0.7
 
 # CORS
 python-cors==1.0.1
+
+# HTTP Client
+requests==2.31.0
